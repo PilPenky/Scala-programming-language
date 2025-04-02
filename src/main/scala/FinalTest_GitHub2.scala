@@ -1,10 +1,11 @@
 import Color._
-import FinalTest.system.log
+import FinalTest_GitHub2.system.log
 import akka.actor.{Actor, ActorLogging, ActorSystem, Props}
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.unmarshalling.Unmarshal
 import akka.stream.ActorMaterializer
+import akka.stream.scaladsl.{Sink, Source}
 import akka.util.Timeout
 import io.circe.Json
 import io.circe.parser.parse
@@ -33,6 +34,13 @@ object HttpClientActor {
   case class DataReceived(json: Json) extends Events
 
   case class FetchError(reason: String) extends Events
+
+
+  case class DeleteData(ids: List[String]) extends Commands
+
+  case class DataDeleted(id: String) extends Events
+
+  case class DeleteError(id: String, reason: String) extends Events
 }
 
 // Сообщения для актора-хранилища
@@ -64,6 +72,9 @@ class HttpClientActor extends Actor with ActorLogging {
   implicit val executionContext: ExecutionContextExecutor = context.dispatcher
 
   private val url = "http://localhost:9001"
+  private val maxParallelDeletes = 1
+  private val retryAttempts = 3
+  private val delayBetweenRequests = 200.millis
 
   override def receive: Receive = {
     case FetchData =>
@@ -85,6 +96,39 @@ class HttpClientActor extends Actor with ActorLogging {
           originalSender ! FetchError(ex.getMessage)
       }
 
+    case DeleteData(restIds) =>
+      val originalSender = sender()
+      log.info(colorStart + s"Starting deletion of ${restIds.size} restIds (max $maxParallelDeletes parallel)" + colorEnd)
+
+      Source(restIds)
+        .mapAsync(maxParallelDeletes) { restId =>
+          akka.pattern.after(delayBetweenRequests, system.scheduler) {
+            deleteDataFromServer(restId, retryAttempts)
+              .map(_ => DataDeleted(restId))
+              .recover { case ex => DeleteError(restId, ex.getMessage) }
+          }
+        }
+        .runWith(Sink.foreach { result =>
+          self ! result
+          originalSender ! result
+        })
+
+    case DeleteData(ids) =>
+      val originalSender = sender()
+      log.info(colorStart + s"Starting deletion of ${ids.size} items" + colorEnd)
+
+      // Отправляем запросы на удаление для каждого ID
+      ids.foreach { id =>
+        deleteDataFromServer(id).onComplete {
+          case scala.util.Success(_) =>
+            self ! DataDeleted(id)
+            originalSender ! DataDeleted(id)
+          case scala.util.Failure(ex) =>
+            self ! DeleteError(id, ex.getMessage)
+            originalSender ! DeleteError(id, ex.getMessage)
+        }
+      }
+
     case DataReceived(json) =>
       log.info(colorStart + "Successfully received and parsed JSON data" + colorEnd)
 
@@ -101,6 +145,31 @@ class HttpClientActor extends Actor with ActorLogging {
         case resp =>
           Future.failed(new RuntimeException(s"Unexpected status code: ${resp.status}"))
       }
+  }
+
+  private def deleteDataFromServer(restId: String, attempts: Int = 3): Future[Unit] = {
+    val urlExtension = s"/rest/$restId"
+
+    def attempt(n: Int): Future[Unit] = {
+      if (n <= 0) {
+        log.error(s"Failed to delete restId $restId after $attempts attempts")
+        Future.failed(new RuntimeException(s"Final delete failed for: $restId"))
+      } else {
+        Http().singleRequest(HttpRequest(
+          method = HttpMethods.DELETE,
+          uri = url + urlExtension
+        )).flatMap {
+          case HttpResponse(StatusCodes.OK, _, _, _) =>
+            log.info(s"Successfully deleted restId: $restId (attempt ${attempts - n + 1}/$attempts)")
+            Future.successful(())
+          case resp =>
+            log.warning(s"Delete attempt failed for $restId (${resp.status}), retrying...")
+            attempt(n - 1)
+        }
+      }
+    }
+
+    attempt(attempts)
   }
 }
 
@@ -240,6 +309,8 @@ class MainActor extends Actor with ActorLogging {
   implicit val timeout: Timeout = Timeout(5.seconds)
   implicit val executionContext: ExecutionContextExecutor = context.dispatcher
 
+  var deletedCount = 0
+  var totalIds = 0
   override def receive: Receive = {
     case "start" =>
       log.info(colorStart + "Starting data processing..." + colorEnd)
@@ -251,13 +322,65 @@ class MainActor extends Actor with ActorLogging {
       storageActor ! SaveXml(xmlData, outputPathXML)
 
     case XmlSaved(_) =>
-      log.info(colorStart + "XML saved, starting conversion to JSON..." + colorEnd)
-      // Добавить удаление данных с сервера + обновление сервера, после преобразование
+      log.info(colorStart + "XML saved, extracting IDs for deletion..." + colorEnd)
+      // Здесь нужно прочитать файл и извлечь IDs
       storageActor ! ReadXml(outputPathXML)
 
+
+    // Модифицируем case DataDeleted
+    case DataDeleted(id) =>
+      deletedCount += 1
+      log.info(colorStart + s"Successfully deleted data with ID: $id ($deletedCount/$totalIds)" + colorEnd)
+      if (deletedCount == totalIds) {
+        log.info(colorStart + "All data deleted from server, converting to JSON..." + colorEnd)
+        storageActor ! ConvertXmlToJson(outputPathXML, outputPathJSON)
+      }
+
     case XmlRead(xml) =>
-      log.info(colorStart + "Converting XML to JSON..." + colorEnd)
-      storageActor ! ConvertXmlToJson(outputPathXML, outputPathJSON)
+      log.info(colorStart + "Extracting restIds from XML..." + colorEnd)
+
+      // Извлекаем restIds (новый метод)
+      val restIds = extractRestIdsFromXml(xml)
+
+      log.info(colorStart + s"Found ${restIds.size} restIds to delete: ${restIds.take(5).mkString(", ")}${if(restIds.size > 5) ", ..." else ""}" + colorEnd)
+
+      if (restIds.nonEmpty) {
+        context.become(waitingForDeletion(restIds, restIds.size))
+        httpClient ! DeleteData(restIds)
+      } else {
+        log.info(colorStart + "No restIds found, skipping deletion" + colorEnd)
+        storageActor ! ConvertXmlToJson(outputPathXML, outputPathJSON)
+      }
+
+      def waitingForDeletion(remainingIds: List[String], totalIds: Int): Receive = {
+        case DataDeleted(id) =>
+          val newRemaining = remainingIds.filterNot(_ == id)
+          val deletedCount = totalIds - newRemaining.size
+          log.info(colorStart + s"Deleted ID: $id ($deletedCount/$totalIds)" + colorEnd)
+
+          if (newRemaining.isEmpty) {
+            log.info(colorStart + "All data deleted from server, converting to JSON..." + colorEnd)
+            storageActor ! ConvertXmlToJson(outputPathXML, outputPathJSON)
+            context.unbecome()
+          } else {
+            context.become(waitingForDeletion(newRemaining, totalIds))
+          }
+
+        case DeleteError(id, reason) =>
+          log.error(s"Failed to delete ID $id: $reason. Continuing with remaining IDs...")
+          val newRemaining = remainingIds.filterNot(_ == id)
+          if (newRemaining.isEmpty) {
+            log.info(colorStart + "All possible deletions completed, converting to JSON..." + colorEnd)
+            storageActor ! ConvertXmlToJson(outputPathXML, outputPathJSON)
+            context.unbecome()
+          } else {
+            context.become(waitingForDeletion(newRemaining, totalIds))
+          }
+      }
+
+
+    case DeleteError(id, reason) =>
+      log.error(s"Failed to delete $id: $reason")
 
     // Сохранить преобразованный JSON на сервер методом POST
 
@@ -275,9 +398,19 @@ class MainActor extends Actor with ActorLogging {
       log.error(s"Failed to save XML: $reason")
       context.system.terminate()
   }
+  private def extractRestIdsFromXml(xml: Elem): List[String] = {
+    // Ищем все поля с name="restId" внутри object/field
+    (xml \\ "field")
+      .filter(f => (f \ "@name").text == "restId")
+      .flatMap(_.child.collect {
+        case e if e.label == "string" => e.text.trim
+      })
+      .toList
+      .distinct
+  }
 }
 
-object FinalTest extends App {
+object FinalTest_GitHub2 extends App {
   implicit val system: ActorSystem = ActorSystem("AkkaHttpActorSystem")
   implicit val materializer: ActorMaterializer = ActorMaterializer()
   implicit val executionContext: ExecutionContextExecutor = system.dispatcher
